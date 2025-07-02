@@ -1,0 +1,13 @@
+[workspace]
+resolver = "2"
+
+members = [
+    "crates/p2p-node",
+    "crates/p2p-cli",
+]
+
+[workspace.package]
+edition = "2021"
+authors = ["Ricky Reddy Gari <ricky@example.com>"]
+license = "Apache-2.0"
+repository = "https://github.com/yourusername/p2p-chatroom"
