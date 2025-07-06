@@ -1,11 +1,14 @@
 use crate::identity::NodeIdentity;
 use crate::metrics::NodeMetrics;
-use crate::node::{GossipMessage, NodeEvent};
-use anyhow::{Context, Result};
+use anyhow::{anyhow, Context, Result};
+use libp2p::core::{muxing::StreamMuxerBox, transport::Boxed, upgrade::Version};
 use libp2p::swarm::NetworkBehaviour;
-use libp2p::TransportExt;
-use libp2p::{autonat, gossipsub, identify, kad, ping, request_response, SwarmBuilder};
+use libp2p::{
+    autonat, dns, gossipsub, identify, kad, noise, ping, quic, tcp, yamux, Multiaddr, PeerId,
+    StreamProtocol, Transport,
+};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -23,68 +26,115 @@ pub enum NodeError {
 
 #[derive(Clone)]
 pub struct NodeConfig {
-    pub bootstrap: Vec<String>,
-    pub stun_servers: Vec<String>,
-    pub listen_tcp: String,
-    pub listen_quic: Option<String>,
+    pub bootstrap: Vec<Multiaddr>,
+    pub local_bind_addr: Multiaddr,
+    pub quic_listen_addr: Option<Multiaddr>,
     pub metrics_addr: SocketAddr,
     pub gossip_validation_mode: gossipsub::ValidationMode,
     pub kad_parallelism: u8,
+    pub enable_tcp: bool,
+    pub enable_quic: bool,
 }
 
 impl Default for NodeConfig {
     fn default() -> Self {
         Self {
             bootstrap: Vec::new(),
-            stun_servers: vec!["stun.l.google.com:19302".into()],
-            listen_tcp: "/ip4/0.0.0.0/tcp/0".into(),
-            listen_quic: Some("/ip4/0.0.0.0/udp/0/quic-v1".into()),
+            local_bind_addr: "/ip4/0.0.0.0/tcp/0".parse().expect("valid addr"),
+            quic_listen_addr: Some("/ip4/0.0.0.0/udp/0/quic-v1".parse().expect("valid addr")),
             metrics_addr: "0.0.0.0:9898".parse().expect("valid socket addr"),
             gossip_validation_mode: gossipsub::ValidationMode::Strict,
             kad_parallelism: 3,
+            enable_tcp: true,
+            enable_quic: true,
         }
     }
 }
 
-pub fn build_swarm(
-    config: &NodeConfig,
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GossipMessage {
+    pub from: PeerId,
+    pub timestamp: u64,
+    pub payload: Vec<u8>,
+}
+
+impl GossipMessage {
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        Ok(serde_json::to_vec(self)?)
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        Ok(serde_json::from_slice(bytes)?)
+    }
+}
+
+pub fn build_transport(
     identity: &NodeIdentity,
-) -> Result<libp2p::Swarm<NodeBehaviour>> {
-    let mut builder = SwarmBuilder::with_existing_identity(identity.keypair().clone()).with_tokio();
+    config: &NodeConfig,
+) -> Result<Boxed<(PeerId, StreamMuxerBox)>> {
+    let mut transport: Option<Boxed<(PeerId, StreamMuxerBox)>> = None;
 
-    builder = builder.with_tcp(
-        Default::default(),
-        (libp2p::tls::Config::new, libp2p::noise::Config::new),
-        libp2p::yamux::Config::default,
-    )?;
-
-    if config.listen_quic.is_some() {
-        builder = builder.with_quic();
+    if config.enable_tcp {
+        let tcp_transport = tcp::tokio::Transport::new(tcp::Config::default())
+            .upgrade(Version::V1Lazy)
+            .authenticate(noise::Config::new(identity.keypair())?)
+            .multiplex(yamux::Config::default())
+            .map(|(peer, muxer), _| (peer, StreamMuxerBox::new(muxer)))
+            .boxed();
+        transport = Some(tcp_transport);
     }
 
-    builder = builder.with_behaviour(|_| {
-        build_behaviour(config, identity.clone(), Arc::new(NodeMetrics::new()?))
-    })?;
-
-    let mut swarm = builder.build();
-
-    let listen_tcp = config.listen_tcp.parse()?;
-    swarm.listen_on(listen_tcp)?;
-
-    if let Some(quic_addr) = &config.listen_quic {
-        swarm.listen_on(quic_addr.parse()?)?;
+    if config.enable_quic {
+        let quic_transport = quic::tokio::Transport::new(quic::Config::new(identity.keypair()))
+            .map(|(peer, muxer), _| (peer, StreamMuxerBox::new(muxer)))
+            .boxed();
+        transport = Some(match transport {
+            Some(existing) => existing.or_transport(quic_transport).boxed(),
+            None => quic_transport,
+        });
     }
 
-    for addr in &config.bootstrap {
-        if let Ok(multiaddr) = addr.parse() {
-            swarm
-                .behaviour_mut()
-                .kad
-                .add_address(&identity.peer_id, multiaddr);
-        }
-    }
+    let transport = transport.ok_or_else(|| anyhow!("no transports enabled"))?;
+    let transport = dns::tokio::Transport::system(transport)?;
+    Ok(transport.boxed())
+}
 
-    Ok(swarm)
+pub enum NodeEvent {
+    Gossipsub(gossipsub::Event),
+    Identify(identify::Event),
+    Ping(ping::Event),
+    Kad(kad::Event),
+    Autonat(autonat::Event),
+}
+
+impl From<gossipsub::Event> for NodeEvent {
+    fn from(event: gossipsub::Event) -> Self {
+        Self::Gossipsub(event)
+    }
+}
+
+impl From<identify::Event> for NodeEvent {
+    fn from(event: identify::Event) -> Self {
+        Self::Identify(event)
+    }
+}
+
+impl From<ping::Event> for NodeEvent {
+    fn from(event: ping::Event) -> Self {
+        Self::Ping(event)
+    }
+}
+
+impl From<kad::Event> for NodeEvent {
+    fn from(event: kad::Event) -> Self {
+        Self::Kad(event)
+    }
+}
+
+impl From<autonat::Event> for NodeEvent {
+    fn from(event: autonat::Event) -> Self {
+        Self::Autonat(event)
+    }
 }
 
 #[derive(NetworkBehaviour)]
@@ -95,7 +145,6 @@ pub struct NodeBehaviour {
     pub ping: ping::Behaviour,
     pub kad: kad::Behaviour<kad::store::MemoryStore>,
     pub autonat: autonat::Behaviour,
-    pub request_response: request_response::Behaviour<ChatCodec>,
 }
 
 pub fn build_behaviour(
@@ -106,22 +155,22 @@ pub fn build_behaviour(
     let gossipsub_config = gossipsub::ConfigBuilder::default()
         .heartbeat_interval(Duration::from_secs(1))
         .validation_mode(config.gossip_validation_mode)
-        .message_id_fn(|message: &gossipsub::Message| {
-            gossipsub::MessageId::from(super::node::hash_message(&message.data))
-        })
+        .message_id_fn(|message: &gossipsub::Message| message_id(&message.data))
         .build()
         .context("gossipsub config")?;
 
     let gossipsub = gossipsub::Behaviour::new(
         gossipsub::MessageAuthenticity::Author(identity.peer_id),
         gossipsub_config,
-    )?;
+    )
+    .map_err(|e| anyhow!(e))?;
 
     let identify_config = identify::Config::new("p2p-chatroom/0.1".into(), identity.public_key());
     let ping_config = ping::Config::new().with_interval(Duration::from_secs(30));
     let store = kad::store::MemoryStore::new(identity.peer_id);
-    let mut kad = kad::Behaviour::with_config(identity.peer_id, store, kad::Config::default());
-    kad.set_query_parallelism(config.kad_parallelism.into());
+    let mut kad_config = kad::Config::new(StreamProtocol::new("/ipfs/kad/1.0.0"));
+    kad_config.set_query_timeout(Duration::from_secs(60));
+    let kad = kad::Behaviour::with_config(identity.peer_id, store, kad_config);
 
     let autonat_config = autonat::Config {
         only_global_ips: false,
@@ -129,16 +178,17 @@ pub fn build_behaviour(
     };
     let autonat = autonat::Behaviour::new(identity.peer_id, autonat_config);
 
-    let protocols = std::iter::once(ChatProtocol);
-    let request_response =
-        request_response::Behaviour::new(ChatCodec::default(), protocols, Default::default());
-
     Ok(NodeBehaviour {
         gossipsub,
         identify: identify::Behaviour::new(identify_config),
         ping: ping::Behaviour::new(ping_config),
         kad,
         autonat,
-        request_response,
     })
+}
+
+fn message_id(data: &[u8]) -> gossipsub::MessageId {
+    let mut hasher = Sha256::new();
+    hasher.update(data);
+    gossipsub::MessageId::from(hasher.finalize().to_vec())
 }

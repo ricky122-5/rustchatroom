@@ -1,8 +1,7 @@
 use anyhow::Result;
-use libp2p::identity::Keypair;
-use libp2p::{identity, PeerId};
+use libp2p::identity::{Keypair, PeerId, PublicKey};
 
-/// Wrapper around a libp2p secp256k1 identity with helpers for signing payloads.
+/// Wrapper around a libp2p identity with helpers for signing payloads.
 pub struct NodeIdentity {
     keypair: Keypair,
     pub peer_id: PeerId,
@@ -16,7 +15,7 @@ impl Clone for NodeIdentity {
 
 impl NodeIdentity {
     pub fn generate() -> Result<Self> {
-        let keypair = Keypair::generate_secp256k1();
+        let keypair = Keypair::generate_ed25519();
         Ok(Self::from_keypair(keypair))
     }
 
@@ -29,7 +28,7 @@ impl NodeIdentity {
         Ok(self.keypair.sign(payload)?)
     }
 
-    pub fn public_key(&self) -> identity::PublicKey {
+    pub fn public_key(&self) -> PublicKey {
         self.keypair.public()
     }
 
