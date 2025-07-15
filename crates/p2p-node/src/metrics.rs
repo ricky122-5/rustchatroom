@@ -1,4 +1,6 @@
 use anyhow::{anyhow, Result};
+use hyper::header::{HeaderValue, CONTENT_TYPE};
+use hyper::{Body, Response, StatusCode};
 use prometheus::{Encoder, IntCounter, IntGauge, Opts, Registry, TextEncoder};
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -13,6 +15,8 @@ pub struct NodeMetrics {
     pub gossip_received: IntCounter,
     pub peers_gauge: IntGauge,
     pub ping_latency: IntGauge,
+    pub hole_punch_attempts: IntCounter,
+    pub hole_punch_success: IntCounter,
 }
 
 impl NodeMetrics {
@@ -32,11 +36,21 @@ impl NodeMetrics {
             "ping_latency_ms",
             "Last observed RTT to peer in milliseconds",
         ))?;
+        let hole_punch_attempts = IntCounter::with_opts(Opts::new(
+            "hole_punch_attempts",
+            "Total UDP hole punch attempts initiated",
+        ))?;
+        let hole_punch_success = IntCounter::with_opts(Opts::new(
+            "hole_punch_success",
+            "Successful UDP hole punch sessions",
+        ))?;
 
         registry.register(Box::new(gossip_published.clone()))?;
         registry.register(Box::new(gossip_received.clone()))?;
         registry.register(Box::new(peers_gauge.clone()))?;
         registry.register(Box::new(ping_latency.clone()))?;
+        registry.register(Box::new(hole_punch_attempts.clone()))?;
+        registry.register(Box::new(hole_punch_success.clone()))?;
 
         Ok(Self {
             registry,
@@ -44,6 +58,8 @@ impl NodeMetrics {
             gossip_received,
             peers_gauge,
             ping_latency,
+            hole_punch_attempts,
+            hole_punch_success,
         })
     }
 
@@ -60,17 +76,26 @@ impl NodeMetrics {
                         let encoder = TextEncoder::new();
                         let metric_families = registry.gather();
                         let mut buffer = Vec::new();
-                        encoder.encode(&metric_families, &mut buffer).map_err(|e| {
+                        if let Err(e) = encoder.encode(&metric_families, &mut buffer) {
                             error!(?e, "encode metrics");
-                            hyper::Error::new_body_write_aborted()
-                        })?;
+                            let mut response =
+                                Response::new(Body::from("failed to encode metrics"));
+                            *response.status_mut() = StatusCode::INTERNAL_SERVER_ERROR;
+                            return Ok::<_, hyper::Error>(response);
+                        }
 
-                        Ok::<_, hyper::Error>(
-                            hyper::Response::builder()
-                                .status(hyper::StatusCode::OK)
-                                .header(hyper::header::CONTENT_TYPE, encoder.format_type())
-                                .body(hyper::Body::from(buffer))?,
-                        )
+                        let mut response = Response::new(Body::from(buffer));
+                        match HeaderValue::from_str(encoder.format_type()) {
+                            Ok(content_type) => {
+                                response.headers_mut().insert(CONTENT_TYPE, content_type);
+                            }
+                            Err(e) => {
+                                error!(?e, "invalid content-type header");
+                                *response.status_mut() = StatusCode::INTERNAL_SERVER_ERROR;
+                                *response.body_mut() = Body::from("invalid content type");
+                            }
+                        }
+                        Ok::<_, hyper::Error>(response)
                     }
                 }))
             }

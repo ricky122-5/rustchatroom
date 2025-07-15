@@ -1,0 +1,121 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: rustchatroom
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: bootstrap-config
+  namespace: rustchatroom
+data:
+  bootstrap.multiaddr: "/dns4/bootstrap.rustchatroom.svc.cluster.local/tcp/4001/p2p/12D3KooWbootstrap"
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: bootstrap-node
+  namespace: rustchatroom
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: bootstrap-node
+  template:
+    metadata:
+      labels:
+        app: bootstrap-node
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9898"
+    spec:
+      containers:
+        - name: bootstrap
+          image: rustchatroom/bootstrap:latest
+          imagePullPolicy: IfNotPresent
+          args:
+            - run
+            - --listen
+            - /ip4/0.0.0.0/tcp/4001
+            - --metrics
+            - 0.0.0.0:9898
+            - --tcp-only
+            - --no-stdin
+          ports:
+            - name: p2p
+              containerPort: 4001
+            - name: metrics
+              containerPort: 9898
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: bootstrap
+  namespace: rustchatroom
+spec:
+  selector:
+    app: bootstrap-node
+  ports:
+    - name: p2p
+      port: 4001
+      targetPort: p2p
+    - name: metrics
+      port: 9898
+      targetPort: metrics
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: chat-nodes
+  namespace: rustchatroom
+spec:
+  replicas: 6
+  selector:
+    matchLabels:
+      app: chat-node
+  template:
+    metadata:
+      labels:
+        app: chat-node
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9898"
+    spec:
+      containers:
+        - name: node
+          image: rustchatroom/bootstrap:latest
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: BOOTSTRAP_MULTIADDR
+              valueFrom:
+                configMapKeyRef:
+                  name: bootstrap-config
+                  key: bootstrap.multiaddr
+          args:
+            - run
+            - --bootstrap
+            - $(BOOTSTRAP_MULTIADDR)
+            - --metrics
+            - 0.0.0.0:9898
+            - --no-stdin
+          ports:
+            - name: metrics
+              containerPort: 9898
+---
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: rustchatroom
+  namespace: rustchatroom
+  labels:
+    release: prometheus
+spec:
+  namespaceSelector:
+    matchNames:
+      - rustchatroom
+  endpoints:
+    - port: metrics
+      interval: 15s
+  selector:
+    matchLabels:
+      app: chat-node

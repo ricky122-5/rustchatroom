@@ -1,0 +1,57 @@
+version: "3.9"
+
+services:
+  bootstrap:
+    build:
+      context: ../..
+      dockerfile: deploy/docker/Dockerfile
+    image: rustchatroom/bootstrap:latest
+    container_name: p2p-bootstrap
+    environment:
+      - RUST_LOG=info
+    command:
+      [
+        "--listen",
+        "/ip4/0.0.0.0/tcp/4001",
+        "--metrics",
+        "0.0.0.0:9898",
+        "--tcp-only",
+        "--no-stdin",
+      ]
+    volumes:
+      - bootstrap-identity:/identity
+    ports:
+      - "4001:4001"
+      - "9898:9898"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9898/metrics"]
+      interval: 10s
+      timeout: 2s
+      retries: 5
+
+  chat:
+    image: rustchatroom/bootstrap:latest
+    depends_on:
+      - bootstrap
+    environment:
+      RUST_LOG: info
+    command:
+      [
+        "--bootstrap",
+        "${BOOTSTRAP_MULTIADDR}",
+        "--metrics",
+        "0.0.0.0:9898",
+        "--no-stdin",
+      ]
+    deploy:
+      replicas: 1
+    ports:
+      - "0"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9898/metrics"]
+      interval: 15s
+      timeout: 3s
+      retries: 3
+
+volumes:
+  bootstrap-identity:

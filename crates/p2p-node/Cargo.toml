@@ -9,22 +9,20 @@ async-trait = "0.1"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 futures = "0.3"
 hex = "0.4"
-libp2p = { version = "0.54", default-features = false, features = ["autonat", "dns", "identify", "kad", "macros", "noise", "ping", "quic", "request-response", "tcp", "tokio", "yamux", "gossipsub", "serde"] }
+libp2p = { version = "0.54", default-features = false, features = ["autonat", "dns", "identify", "kad", "macros", "noise", "ping", "quic", "request-response", "tcp", "tokio", "yamux", "gossipsub", "serde", "secp256k1"] }
+libp2p-identity = { version = "0.2", features = ["secp256k1", "peerid", "rand"] }
 prometheus = "0.13"
 rand = { version = "0.8", features = ["std", "std_rng"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
-stun = "0.5"
+stunclient = "0.4"
 thiserror = "1"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time", "signal", "net"] }
+tokio-stream = { version = "0.1", features = ["sync"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 hyper = { version = "0.14", features = ["full"] }
-
-[dependencies.secp256k1]
-version = "0.28"
-features = ["rand-std", "serde"]
 
 [features]
 default = ["metrics"]

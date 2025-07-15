@@ -1,18 +1,26 @@
 use crate::identity::NodeIdentity;
 use crate::metrics::NodeMetrics;
 use anyhow::{anyhow, Context, Result};
+use futures::future::Either;
 use libp2p::core::{muxing::StreamMuxerBox, transport::Boxed, upgrade::Version};
+use libp2p::multiaddr::Protocol;
 use libp2p::swarm::NetworkBehaviour;
 use libp2p::{
     autonat, dns, gossipsub, identify, kad, noise, ping, quic, tcp, yamux, Multiaddr, PeerId,
     StreamProtocol, Transport,
 };
+use libp2p_identity as identity;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::net::SocketAddr;
+use std::collections::HashSet;
+use std::net::{IpAddr, SocketAddr, UdpSocket};
+use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::time::Duration;
+use stunclient::StunClient;
 use thiserror::Error;
+use tokio::task;
+use tracing::warn;
 
 #[derive(Debug, Error)]
 pub enum NodeError {
@@ -34,6 +42,10 @@ pub struct NodeConfig {
     pub kad_parallelism: u8,
     pub enable_tcp: bool,
     pub enable_quic: bool,
+    pub enable_udp: bool,
+    pub udp_port: u16,
+    pub stun_servers: Vec<SocketAddr>,
+    pub external_addresses: Vec<Multiaddr>,
 }
 
 impl Default for NodeConfig {
@@ -47,6 +59,13 @@ impl Default for NodeConfig {
             kad_parallelism: 3,
             enable_tcp: true,
             enable_quic: true,
+            enable_udp: true,
+            udp_port: 0,
+            stun_servers: vec![
+                "34.120.84.149:3478".parse().expect("valid stun addr"), // stun.l.google.com
+                "34.192.213.134:3478".parse().expect("valid stun addr"), // global.stun.twilio.com
+            ],
+            external_addresses: Vec::new(),
         }
     }
 }
@@ -55,16 +74,89 @@ impl Default for NodeConfig {
 pub struct GossipMessage {
     pub from: PeerId,
     pub timestamp: u64,
-    pub payload: Vec<u8>,
+    pub payload: GossipPayload,
+    pub signature: Vec<u8>,
+    pub public_key: Vec<u8>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum GossipPayload {
+    Chat {
+        data: Vec<u8>,
+    },
+    Announcement {
+        udp_port: u16,
+        addresses: Vec<String>,
+    },
 }
 
 impl GossipMessage {
+    pub fn new_signed(
+        identity: &NodeIdentity,
+        timestamp: u64,
+        payload: GossipPayload,
+    ) -> Result<Self> {
+        let payload_bytes = serde_json::to_vec(&payload)?;
+        let material = signature_material(&identity.peer_id, timestamp, &payload_bytes);
+        let signature = identity.sign(&material)?;
+        Ok(Self {
+            from: identity.peer_id,
+            timestamp,
+            payload,
+            signature,
+            public_key: identity.public_key_protobuf(),
+        })
+    }
+
+    pub fn chat(identity: &NodeIdentity, timestamp: u64, data: Vec<u8>) -> Result<Self> {
+        Self::new_signed(identity, timestamp, GossipPayload::Chat { data })
+    }
+
+    pub fn announcement(
+        identity: &NodeIdentity,
+        timestamp: u64,
+        udp_port: u16,
+        addresses: Vec<String>,
+    ) -> Result<Self> {
+        Self::new_signed(
+            identity,
+            timestamp,
+            GossipPayload::Announcement {
+                udp_port,
+                addresses,
+            },
+        )
+    }
+
     pub fn encode(&self) -> Result<Vec<u8>> {
         Ok(serde_json::to_vec(self)?)
     }
 
     pub fn decode(bytes: &[u8]) -> Result<Self> {
         Ok(serde_json::from_slice(bytes)?)
+    }
+
+    pub fn verify(&self) -> Result<()> {
+        let libp2p_key = identity::PublicKey::try_decode_protobuf(&self.public_key)
+            .map_err(|e| anyhow!("decode public key: {e}"))?;
+
+        let derived_peer = PeerId::from(libp2p_key.clone());
+        if derived_peer != self.from {
+            return Err(anyhow!(
+                "message public key peer id mismatch: expected {from:?}, got {derived:?}",
+                from = self.from,
+                derived = derived_peer
+            ));
+        }
+
+        let payload_bytes = serde_json::to_vec(&self.payload)?;
+        let material = signature_material(&self.from, self.timestamp, &payload_bytes);
+        if libp2p_key.verify(&material, &self.signature) {
+            Ok(())
+        } else {
+            Err(anyhow!("signature verification failed"))
+        }
     }
 }
 
@@ -89,7 +181,13 @@ pub fn build_transport(
             .map(|(peer, muxer), _| (peer, StreamMuxerBox::new(muxer)))
             .boxed();
         transport = Some(match transport {
-            Some(existing) => existing.or_transport(quic_transport).boxed(),
+            Some(existing) => existing
+                .or_transport(quic_transport)
+                .map(|either, _| match either {
+                    Either::Left((peer, muxer)) => (peer, muxer),
+                    Either::Right((peer, muxer)) => (peer, muxer),
+                })
+                .boxed(),
             None => quic_transport,
         });
     }
@@ -154,7 +252,7 @@ pub fn build_behaviour(
 ) -> Result<NodeBehaviour> {
     let gossipsub_config = gossipsub::ConfigBuilder::default()
         .heartbeat_interval(Duration::from_secs(1))
-        .validation_mode(config.gossip_validation_mode)
+        .validation_mode(config.gossip_validation_mode.clone())
         .message_id_fn(|message: &gossipsub::Message| message_id(&message.data))
         .build()
         .context("gossipsub config")?;
@@ -170,6 +268,9 @@ pub fn build_behaviour(
     let store = kad::store::MemoryStore::new(identity.peer_id);
     let mut kad_config = kad::Config::new(StreamProtocol::new("/ipfs/kad/1.0.0"));
     kad_config.set_query_timeout(Duration::from_secs(60));
+    if let Some(parallelism) = NonZeroUsize::new(config.kad_parallelism.max(1) as usize) {
+        kad_config.set_parallelism(parallelism);
+    }
     let kad = kad::Behaviour::with_config(identity.peer_id, store, kad_config);
 
     let autonat_config = autonat::Config {
@@ -191,4 +292,69 @@ fn message_id(data: &[u8]) -> gossipsub::MessageId {
     let mut hasher = Sha256::new();
     hasher.update(data);
     gossipsub::MessageId::from(hasher.finalize().to_vec())
+}
+
+fn signature_material(peer: &PeerId, timestamp: u64, payload: &[u8]) -> Vec<u8> {
+    let mut data = Vec::with_capacity(peer.clone().to_bytes().len() + payload.len() + 8);
+    data.extend_from_slice(&peer.clone().to_bytes());
+    data.extend_from_slice(&timestamp.to_le_bytes());
+    data.extend_from_slice(payload);
+    data
+}
+
+pub async fn discover_external_addresses(stun_servers: &[SocketAddr]) -> Result<Vec<Multiaddr>> {
+    if stun_servers.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut discovered = HashSet::new();
+
+    for server in stun_servers {
+        let server_addr = *server;
+        match task::spawn_blocking(move || query_stun(server_addr)).await {
+            Ok(Ok(addr)) => {
+                for multi in socketaddr_to_multiaddrs(addr) {
+                    discovered.insert(multi);
+                }
+            }
+            Ok(Err(e)) => {
+                warn!(?server, ?e, "stun discovery failed");
+            }
+            Err(e) => {
+                warn!(?server, ?e, "stun task join error");
+            }
+        }
+    }
+
+    Ok(discovered.into_iter().collect())
+}
+
+fn query_stun(server: SocketAddr) -> Result<SocketAddr> {
+    let socket = UdpSocket::bind("0.0.0.0:0")?;
+    socket.connect(server)?;
+    socket.set_read_timeout(Some(Duration::from_secs(3)))?;
+    socket.set_write_timeout(Some(Duration::from_secs(3)))?;
+    let client = StunClient::new(server);
+    let addr = client.query_external_address(&socket)?;
+    Ok(addr)
+}
+
+fn socketaddr_to_multiaddrs(addr: SocketAddr) -> Vec<Multiaddr> {
+    let mut addrs = Vec::new();
+    let ip_proto = match addr.ip() {
+        IpAddr::V4(v4) => Protocol::Ip4(v4),
+        IpAddr::V6(v6) => Protocol::Ip6(v6),
+    };
+
+    let mut udp_addr = Multiaddr::empty();
+    udp_addr.push(ip_proto.clone());
+    udp_addr.push(Protocol::Udp(addr.port()));
+    addrs.push(udp_addr);
+
+    let mut tcp_addr = Multiaddr::empty();
+    tcp_addr.push(ip_proto);
+    tcp_addr.push(Protocol::Tcp(addr.port()));
+    addrs.push(tcp_addr);
+
+    addrs
 }

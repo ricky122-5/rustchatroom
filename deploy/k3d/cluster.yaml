@@ -1,0 +1,24 @@
+apiVersion: k3d.io/v1alpha5
+kind: Simple
+metadata:
+  name: rustchatroom
+servers: 1
+agents: 6
+image: rancher/k3s:v1.29.4-k3s1
+network:
+  name: rustchatroom
+ports:
+  - port: 80:30000@loadbalancer
+  - port: 31000-31020:31000-31020@agent
+options:
+  k3d:
+    wait: true
+    timeout: 120s
+  kubeconfig:
+    updateDefaultKubeconfig: true
+    switchCurrentContext: true
+registries:
+  create:
+    name: rustchatroom-registry
+    host: 0.0.0.0
+    hostPort: "5200"
